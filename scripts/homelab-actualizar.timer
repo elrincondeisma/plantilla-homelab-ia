@@ -1,0 +1,15 @@
+[Unit]
+Description=Ronda diaria de actualizaciones del homelab
+
+[Timer]
+# Nodo 1 a las 04:00. En el resto de nodos, un drop-in que desfase la hora para
+# que no se actualicen a la vez (ver docs/MANTENIMIENTO.md):
+#   /etc/systemd/system/homelab-actualizar.timer.d/desfase.conf
+#     [Timer]
+#     OnCalendar=
+#     OnCalendar=*-*-* 05:00:00
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

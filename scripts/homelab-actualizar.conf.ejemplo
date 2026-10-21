@@ -1,0 +1,28 @@
+# /etc/homelab-actualizar.conf
+# Es un fichero de shell que lee el script (propietario root, permisos 644 o 600).
+# Todo lo que no pongas aquí toma el valor por defecto que figura en el script.
+
+# Guests que no se tocan nunca (ids separados por espacio o coma).
+EXCLUIR="900"
+
+# Guests que no admiten snapshot (por ejemplo, con un bind mount compartido).
+# Para estos la copia previa es un vzdump y no hay vuelta automática.
+SIN_SNAPSHOT="901"
+
+# Almacenamiento donde se guardan las copias vzdump.
+ALMACEN_COPIAS="nas"
+
+# Cuánto esperar, en segundos, a que un guest vuelva tras reiniciarse.
+ESPERA_ARRANQUE=90
+
+# Los puertos que escuchan solo en 127.0.0.1 o ::1 no cuentan en la verificación
+# (1 por defecto). Poner 0 para que cuenten.
+IGNORAR_LOOPBACK=1
+
+# Puertos que la verificación no debe mirar, por guest: "id:puerto,puerto ...".
+# Con * valen para todos los guests. Útil para puertos que cambian en cada arranque.
+PUERTOS_IGNORADOS="902:8123,9000 *:9999"
+
+# Ejecutable que recibe el mensaje como primer argumento cuando algo falla
+# (envía una notificación push, un correo...). Vacío = sin avisos.
+AVISO_COMANDO=""

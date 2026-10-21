@@ -1,0 +1,11 @@
+[Unit]
+Description=Actualiza los contenedores del nodo con copia, verificación y marcha atrás
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/homelab-actualizar ronda
+# Una ronda puede durar mucho, pero no indefinidamente.
+TimeoutStartSec=4h
+Nice=10

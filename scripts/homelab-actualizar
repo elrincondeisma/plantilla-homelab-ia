@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+# homelab-actualizar: actualiza el sistema operativo de los contenedores (CT)
+# de un nodo Proxmox con copia previa, verificación y marcha atrás.
+#
+# Se instala en cada nodo como /usr/local/bin/homelab-actualizar.
+# Ver docs/MANTENIMIENTO.md para el diseño completo.
+#
+# Uso:
+#   homelab-actualizar plan [--solo 101,102] [--refrescar]
+#   homelab-actualizar guest <id>
+#   homelab-actualizar ronda [--solo 101,102]
+#   homelab-actualizar estado
+#   homelab-actualizar cuarentena lista
+#   homelab-actualizar cuarentena quitar <id>
+#
+# Opciones:
+#   --simular        no cambia nada: enseña lo que haría
+#   --ensayo-fallo   hace el ciclo y finge que la verificación falla, para
+#                    ensayar la vuelta al snapshot sobre un guest de verdad
+#   --solo a,b,c     limita plan/ronda a esos ids
+#   --refrescar      plan: actualiza antes el índice de paquetes del guest
+#
+# Configuración: /etc/homelab-actualizar.conf, o el fichero que diga la
+# variable HOMELAB_ACTUALIZAR_CONF. Ver scripts/homelab-actualizar.conf.ejemplo.
+
+set -o pipefail
+export LC_ALL=C
+
+CONF="${HOMELAB_ACTUALIZAR_CONF:-/etc/homelab-actualizar.conf}"
+
+# ------------------------------------------------------------ configuración
+EXCLUIR=""                    # ids que no se tocan nunca (separados por espacio o coma)
+SIN_SNAPSHOT=""               # ids que no admiten snapshot: copia con vzdump
+ALMACEN_COPIAS="local"        # almacenamiento para las copias vzdump
+MODO_VZDUMP="suspend"         # suspend | stop (snapshot no sirve si el guest no admite snapshots)
+DIR_ESTADO="/var/lib/homelab-actualizar"
+LOG="/var/log/homelab-actualizar.log"
+ESPERA_ARRANQUE=60            # segundos de margen para que un guest vuelva tras reiniciar
+IGNORAR_LOOPBACK=1            # 1 = no cuenta los puertos que escuchan solo en 127.0.0.1 / ::1
+PUERTOS_IGNORADOS=""          # "107:8080,5555 128:9000 *:9999"  (id:puertos, * = todos los guests)
+AVISO_COMANDO=""              # ruta a un ejecutable que recibe el mensaje como $1 (ntfy, mail...)
+
+if [ -e "$CONF" ]; then
+  if [ -n "$(find "$CONF" -maxdepth 0 -perm -002 2>/dev/null)" ]; then
+    echo "homelab-actualizar: $CONF es escribible por cualquiera; se ignora por seguridad (chmod 644 o 600)." >&2
+    exit 2
+  fi
+  # shellcheck disable=SC1090
+  . "$CONF"
+fi
+
+# ------------------------------------------------------------------ opciones
+SIMULAR=0
+ENSAYO=0
+REFRESCAR=0
+SOLO=""
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --simular) SIMULAR=1 ;;
+    --ensayo-fallo) ENSAYO=1 ;;
+    --refrescar) REFRESCAR=1 ;;
+    --solo) shift; SOLO="${1:-}" ;;
+    --solo=*) SOLO="${1#--solo=}" ;;
+    -h|--help|ayuda) POS+=("ayuda") ;;
+    *) POS+=("$1") ;;
+  esac
+  shift
+done
+set -- "${POS[@]}"
+
+ayuda() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
+}
+
+# ------------------------------------------------------------------- avisos
+log() {
+  local m
+  m="$(date '+%F %T') $*"
+  echo "$m"
+  if [ "$SIMULAR" -eq 0 ]; then
+    echo "$m" >> "$LOG" 2>/dev/null || true
+  fi
+}
+
+# act "qué hace" comando args...  -> en --simular solo lo cuenta
+act() {
+  local desc=$1; shift
+  if [ "$SIMULAR" -eq 1 ]; then
+    log "[simular] haría: $desc"
+    return 0
+  fi
+  log "$desc"
+  if [ "${ACT_SILENCIO:-0}" = 1 ]; then "$@" >/dev/null; else "$@"; fi
+}
+
+# Igual que act, pero sin la salida del comando (solo cuenta el resultado).
+actq() { ACT_SILENCIO=1 act "$@"; }
+
+avisar() {
+  [ "$SIMULAR" -eq 1 ] && return 0
+  [ -n "$AVISO_COMANDO" ] || return 0
+  "$AVISO_COMANDO" "$1" >/dev/null 2>&1 || log "no se pudo enviar el aviso con $AVISO_COMANDO"
+}
+
+json_esc() { printf '%s' "$1" | tr -d '\n' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+registrar() { # id resultado detalle
+  [ "$SIMULAR" -eq 1 ] && return 0
+  mkdir -p "$DIR_ESTADO" 2>/dev/null || return 0
+  printf '{"fecha":"%s","guest":"%s","resultado":"%s","detalle":"%s"}\n' \
+    "$(date '+%F %T')" "$1" "$2" "$(json_esc "$3")" >> "$DIR_ESTADO/informe.jsonl"
+}
+
+# ------------------------------------------------------------------ listas
+en_lista() { # lista id
+  case " ${1//,/ } " in *" $2 "*) return 0 ;; esac
+  return 1
+}
+excluido() { en_lista "$EXCLUIR" "$1"; }
+en_cuarentena() { [ -e "$DIR_ESTADO/cuarentena/$1" ]; }
+seleccionado() { [ -z "$SOLO" ] || en_lista "$SOLO" "$1"; }
+
+lista_ct() { pct list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1, $2, $NF}'; }
+lista_vm() { qm list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1, $3, $2}'; }
+
+# ------------------------------------------------- lo que corre dentro del guest
+# Cada fragmento empieza con una marca (: HLA_xxx) que no hace nada en el guest,
+# pero permite que los tests con stubs sepan qué se está pidiendo.
+
+SNIP_DETECTAR=': HLA_DETECTAR; if command -v apt-get >/dev/null 2>&1; then echo apt; elif command -v apk >/dev/null 2>&1; then echo apk; else echo desconocido; fi'
+SNIP_REFRESCAR_APT=': HLA_REFRESCAR; apt-get update -qq >/dev/null 2>&1; true'
+SNIP_REFRESCAR_APK=': HLA_REFRESCAR; apk update -q >/dev/null 2>&1; true'
+SNIP_PENDIENTES_APT=": HLA_PENDIENTES; apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true"
+SNIP_PENDIENTES_APK=": HLA_PENDIENTES; apk upgrade --simulate 2>/dev/null | grep -c 'Upgrading' || true"
+SNIP_ACTUALIZAR_APT=': HLA_ACTUALIZAR; export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -qq -o Dpkg::Options::=--force-confold upgrade'
+SNIP_ACTUALIZAR_APK=': HLA_ACTUALIZAR; apk update -q && apk upgrade -q'
+SNIP_REINICIO=': HLA_REINICIO; if [ -e /run/reboot-required ]; then echo si; else echo no; fi'
+
+# La sonda saca una foto de lo que el guest está sirviendo ahora mismo:
+#   PUERTO <hex> <L|E>   puerto en LISTEN (L = solo loopback, E = expuesto)
+#   FALLIDA <unidad>     unidad de systemd en failed
+#   CONTENEDOR <nombre>  contenedor de Docker en marcha
+#   FIN                  marca de que la sonda llegó hasta el final
+# Lee /proc/net/tcp y tcp6 (existen siempre, no hace falta ss ni netstat).
+SONDA_GUEST=$(cat <<'EOS'
+D="${HLA_PROC:-/proc/net}"
+for f in tcp tcp6; do
+  [ -r "$D/$f" ] || continue
+  awk -v f="$f" 'FNR>1 && $4=="0A" {
+    split($2,a,":"); ad=a[1]; t="E"
+    if (f=="tcp" && length(ad)==8 && substr(ad,7,2)=="7F") t="L"
+    if (f=="tcp6" && ad=="00000000000000000000000001000000") t="L"
+    if (f=="tcp6" && length(ad)==32 && substr(ad,1,24)=="0000000000000000FFFF0000" && substr(ad,31,2)=="7F") t="L"
+    print "PUERTO " a[2] " " t
+  }' "$D/$f"
+done
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print "FALLIDA " $1}'
+fi
+if command -v docker >/dev/null 2>&1; then
+  docker ps --format '{{.Names}}' 2>/dev/null | awk '{print "CONTENEDOR " $1}'
+fi
+echo FIN
+EOS
+)
+
+gexec() { # id fragmento
+  pct exec "$1" -- sh -c "$2" 2>/dev/null
+}
+
+sonda() { # id -> salida de la sonda, vacía si falla
+  local b64
+  b64=$(printf '%s\n' "$SONDA_GUEST" | base64 | tr -d '\n')
+  pct exec "$1" -- sh -c ": HLA_SONDA; echo $b64 | base64 -d | sh" 2>/dev/null
+}
+
+# ----------------------------------------------------------------- verificar
+# Puertos ignorados para un guest, en hexadecimal de 4 cifras.
+puertos_ignorados_hex() {
+  local id=$1 tok tid ports p out="" toks
+  read -ra toks <<< "$PUERTOS_IGNORADOS"
+  for tok in "${toks[@]}"; do
+    tid=${tok%%:*}
+    ports=${tok#*:}
+    if [ "$tid" != "$id" ] && [ "$tid" != "*" ]; then continue; fi
+    for p in ${ports//,/ }; do
+      case $p in ''|*[!0-9]*) continue ;; esac
+      out="$out $(printf '%04X' "$p")"
+    done
+  done
+  echo "$out"
+}
+
+# Deja solo los puertos que cuentan: sin loopback (salvo que se pida lo contrario)
+# y sin los ignorados por configuración.
+filtrar_puertos() { # id  (stdin = sonda)
+  local ign
+  ign=$(puertos_ignorados_hex "$1")
+  awk -v loop="$IGNORAR_LOOPBACK" -v ign="$ign " '
+    $1=="PUERTO" {
+      if (loop=="1" && $3=="L") next
+      if (index(" " ign, " " $2 " ")) next
+      print "PUERTO " $2
+    }'
+}
+
+# Compara antes y después. Imprime un motivo por cada empeoramiento.
+# Código 0 = sin empeoramientos.
+comparar() { # id antes despues
+  local id=$1 antes=$2 despues=$3 hex x malo=0
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    hex=${x#PUERTO }
+    echo "el puerto $(printf '%d' "0x$hex") ya no escucha"
+    malo=1
+  done < <(comm -23 <(printf '%s\n' "$antes" | filtrar_puertos "$id" | sort -u) \
+                    <(printf '%s\n' "$despues" | filtrar_puertos "$id" | sort -u))
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    echo "unidad de systemd nueva en failed: ${x#FALLIDA }"
+    malo=1
+  done < <(comm -13 <(printf '%s\n' "$antes" | grep '^FALLIDA ' | sort -u) \
+                    <(printf '%s\n' "$despues" | grep '^FALLIDA ' | sort -u))
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    echo "el contenedor ${x#CONTENEDOR } no ha vuelto"
+    malo=1
+  done < <(comm -23 <(printf '%s\n' "$antes" | grep '^CONTENEDOR ' | sort -u) \
+                    <(printf '%s\n' "$despues" | grep '^CONTENEDOR ' | sort -u))
+  return "$malo"
+}
+
+esperar_guest() { # id
+  local id=$1 t=0
+  [ "$SIMULAR" -eq 1 ] && return 0
+  while [ "$t" -le "$ESPERA_ARRANQUE" ]; do
+    if pct status "$id" 2>/dev/null | grep -q running && pct exec "$id" -- true >/dev/null 2>&1; then
+      return 0
+    fi
+    [ "$t" -ge "$ESPERA_ARRANQUE" ] && break
+    sleep 2
+    t=$((t + 2))
+  done
+  return 1
+}
+
+# ----------------------------------------------------------------- cuarentena
+poner_cuarentena() { # id motivo
+  [ "$SIMULAR" -eq 1 ] && { log "[simular] pondría el guest $1 en cuarentena: $2"; return 0; }
+  mkdir -p "$DIR_ESTADO/cuarentena" 2>/dev/null
+  printf '%s %s\n' "$(date '+%F %T')" "$2" > "$DIR_ESTADO/cuarentena/$1"
+}
+
+cmd_cuarentena() {
+  case "${1:-}" in
+    lista)
+      local f n=0
+      if [ -d "$DIR_ESTADO/cuarentena" ]; then
+        for f in "$DIR_ESTADO/cuarentena"/*; do
+          [ -e "$f" ] || continue
+          echo "$(basename "$f") $(cat "$f")"
+          n=$((n + 1))
+        done
+      fi
+      [ "$n" -eq 0 ] && echo "Cuarentena vacía."
+      return 0
+      ;;
+    quitar)
+      local id=${2:-}
+      case $id in ''|*[!0-9]*) echo "Uso: homelab-actualizar cuarentena quitar <id>" >&2; return 2 ;; esac
+      if ! en_cuarentena "$id"; then echo "El guest $id no está en cuarentena."; return 0; fi
+      if [ "$SIMULAR" -eq 1 ]; then log "[simular] sacaría el guest $id de la cuarentena"; return 0; fi
+      rm -f "$DIR_ESTADO/cuarentena/$id"
+      log "guest $id fuera de cuarentena"
+      return 0
+      ;;
+    *) echo "Uso: homelab-actualizar cuarentena lista | quitar <id>" >&2; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------- plan
+gestor_de() { # id
+  case "$(gexec "$1" "$SNIP_DETECTAR")" in
+    apt) echo apt ;;
+    apk) echo apk ;;
+    *) echo desconocido ;;
+  esac
+}
+
+pendientes_de() { # id gestor
+  local n
+  case "$2" in
+    apt)
+      [ "$REFRESCAR" -eq 1 ] && gexec "$1" "$SNIP_REFRESCAR_APT" >/dev/null
+      n=$(gexec "$1" "$SNIP_PENDIENTES_APT") ;;
+    apk)
+      [ "$REFRESCAR" -eq 1 ] && gexec "$1" "$SNIP_REFRESCAR_APK" >/dev/null
+      n=$(gexec "$1" "$SNIP_PENDIENTES_APK") ;;
+    *) n="" ;;
+  esac
+  case $n in ''|*[!0-9]*) echo "?" ;; *) echo "$n" ;; esac
+}
+
+cmd_plan() {
+  local id estado nombre gestor pend nota
+  printf '%-6s %-10s %-20s %-10s %-10s %s\n' ID ESTADO NOMBRE GESTOR PENDIENTES NOTA
+  while read -r id estado nombre; do
+    [ -n "$id" ] || continue
+    seleccionado "$id" || continue
+    gestor="-"; pend="-"; nota=""
+    if excluido "$id"; then
+      nota="excluido"
+    elif en_cuarentena "$id"; then
+      nota="en cuarentena"
+    elif [ "$estado" != "running" ]; then
+      nota="parado, no se toca"
+    else
+      gestor=$(gestor_de "$id")
+      pend=$(pendientes_de "$id" "$gestor")
+      if en_lista "$SIN_SNAPSHOT" "$id"; then nota="copia con vzdump en $ALMACEN_COPIAS"; else nota="copia con snapshot"; fi
+      [ "$pend" = "0" ] && nota="al día, no se toca"
+      [ "$gestor" = "desconocido" ] && nota="gestor de paquetes no reconocido, no se toca"
+    fi
+    printf '%-6s %-10s %-20s %-10s %-10s %s\n' "$id" "$estado" "$nombre" "$gestor" "$pend" "$nota"
+  done < <(lista_ct)
+  while read -r id estado nombre; do
+    [ -n "$id" ] || continue
+    seleccionado "$id" || continue
+    printf '%-6s %-10s %-20s %-10s %-10s %s\n' "$id" "$estado" "$nombre" "VM" "-" "las VM no se actualizan solas"
+  done < <(lista_vm)
+  return 0
+}
+
+# --------------------------------------------------------------------- guest
+fallo_guest() { # id resultado detalle  (no deja en cuarentena)
+  log "guest $1: $2: $3"
+  registrar "$1" "$2" "$3"
+}
+
+cmd_guest() {
+  local id=${1:-} tipo gestor pend snap="" metodo vz_ok antes despues motivos fallo=0 reinicio
+  case $id in ''|*[!0-9]*) echo "Uso: homelab-actualizar guest <id>" >&2; return 2 ;; esac
+
+  if excluido "$id"; then fallo_guest "$id" omitido "excluido por configuración"; return 0; fi
+  if en_cuarentena "$id"; then
+    fallo_guest "$id" omitido "en cuarentena (cuarentena quitar $id cuando esté revisado)"
+    return 0
+  fi
+
+  if pct status "$id" >/dev/null 2>&1; then
+    tipo=ct
+  elif qm status "$id" >/dev/null 2>&1; then
+    fallo_guest "$id" omitido "es una VM: no se actualiza sola (ver docs/SEGURIDAD.md)"
+    return 0
+  else
+    echo "El guest $id no existe en este nodo." >&2
+    return 2
+  fi
+
+  if ! pct status "$id" 2>/dev/null | grep -q running; then
+    fallo_guest "$id" omitido "parado, no se toca"
+    return 0
+  fi
+
+  gestor=$(gestor_de "$id")
+  if [ "$gestor" = "desconocido" ]; then
+    fallo_guest "$id" omitido "gestor de paquetes no reconocido"
+    return 0
+  fi
+  pend=$(pendientes_de "$id" "$gestor")
+  if [ "$pend" = "0" ]; then
+    log "guest $id: nada pendiente, no se hace copia ni se toca"
+    registrar "$id" al-dia "nada pendiente"
+    return 0
+  fi
+  [ "$pend" = "?" ] && pend="un número no determinado de"
+
+  if en_lista "$SIN_SNAPSHOT" "$id"; then metodo=vzdump; else metodo=snapshot; fi
+  if [ "$ENSAYO" -eq 1 ] && [ "$metodo" = "vzdump" ]; then
+    fallo_guest "$id" omitido "el ensayo de fallo necesita snapshot y este guest está en SIN_SNAPSHOT"
+    return 1
+  fi
+
+  log "guest $id: $pend paquetes pendientes ($gestor); copia previa con $metodo"
+
+  antes=$(sonda "$id")
+  case "$antes" in
+    *FIN*) ;;
+    *) fallo_guest "$id" sin-sonda "la sonda previa no devolvió nada; no se toca"; return 1 ;;
+  esac
+
+  # 1. Copia previa
+  if [ "$metodo" = "snapshot" ]; then
+    snap="hla-$(date +%Y%m%d-%H%M%S)"
+    if ! act "snapshot $snap del guest $id" pct snapshot "$id" "$snap" --description "homelab-actualizar"; then
+      if [ "$ENSAYO" -eq 1 ]; then
+        fallo_guest "$id" sin-copia "el snapshot falló y el ensayo no admite vzdump"
+        return 1
+      fi
+      log "guest $id: el snapshot falló, se intenta con vzdump"
+      snap=""
+      metodo=vzdump
+    fi
+  fi
+  if [ "$metodo" = "vzdump" ]; then
+    if ! act "vzdump del guest $id a $ALMACEN_COPIAS" vzdump "$id" --storage "$ALMACEN_COPIAS" --mode "$MODO_VZDUMP" --compress zstd; then
+      fallo_guest "$id" sin-copia "no se pudo hacer copia previa; no se actualiza"
+      avisar "homelab-actualizar: guest $id sin copia previa, no se actualizó"
+      return 1
+    fi
+  fi
+
+  # 2. Actualizar
+  if [ "$gestor" = "apt" ]; then
+    actq "actualizar el guest $id (apt)" gexec "$id" "$SNIP_ACTUALIZAR_APT" || fallo=1
+  else
+    actq "actualizar el guest $id (apk)" gexec "$id" "$SNIP_ACTUALIZAR_APK" || fallo=1
+  fi
+  motivos=""
+  [ "$fallo" -eq 1 ] && motivos="la actualización terminó con error"
+
+  # 3. Reiniciar solo si hace falta
+  if [ "$SIMULAR" -eq 1 ]; then
+    log "[simular] reiniciaría el guest solo si el sistema lo pide; verificaría comparando la sonda de antes y de después"
+    log "[simular] si la verificación fallara: volvería al snapshot y lo pondría en cuarentena (con vzdump no hay vuelta automática)"
+    return 0
+  fi
+  reinicio=$(gexec "$id" "$SNIP_REINICIO")
+  if [ "$reinicio" = "si" ]; then
+    actq "reiniciar el guest $id (el sistema lo pide)" pct reboot "$id"
+    esperar_guest "$id" || motivos="${motivos:+$motivos; }el guest no volvió tras el reinicio"
+  fi
+
+  # 4. Verificar comparando antes y después
+  despues=$(sonda "$id")
+  case "$despues" in
+    *FIN*)
+      local dif
+      dif=$(comparar "$id" "$antes" "$despues") || motivos="${motivos:+$motivos; }$(echo "$dif" | tr '\n' ',' | sed 's/,$//')"
+      ;;
+    *) motivos="${motivos:+$motivos; }la sonda posterior no devolvió nada" ;;
+  esac
+  if [ "$ENSAYO" -eq 1 ]; then
+    motivos="${motivos:+$motivos; }ensayo-fallo: verificación fingida como fallida"
+  fi
+
+  # 5. Decidir
+  if [ -z "$motivos" ]; then
+    if [ -n "$snap" ]; then actq "borrar el snapshot $snap (todo verificado)" pct delsnapshot "$id" "$snap"; fi
+    [ "$metodo" = "vzdump" ] && log "guest $id: la copia vzdump queda en $ALMACEN_COPIAS (la retención la gestiona el almacén)"
+    log "guest $id: actualizado y verificado"
+    registrar "$id" actualizado "$pend paquetes"
+    return 0
+  fi
+
+  log "guest $id: la verificación falla: $motivos"
+  if [ -z "$snap" ]; then
+    poner_cuarentena "$id" "$motivos"
+    registrar "$id" ROTO "$motivos (copia vzdump intacta; restaurar es manual)"
+    avisar "homelab-actualizar: guest $id ROTO tras actualizar ($motivos). Copia vzdump en $ALMACEN_COPIAS; restaurar es manual."
+    return 1
+  fi
+
+  # Marcha atrás sobre el snapshot
+  pct stop "$id" >/dev/null 2>&1
+  if actq "volver al snapshot $snap del guest $id" pct rollback "$id" "$snap"; then
+    pct start "$id" >/dev/null 2>&1
+    if esperar_guest "$id" && sondeo_sano "$id" "$antes"; then
+      actq "borrar el snapshot $snap (ya revertido)" pct delsnapshot "$id" "$snap"
+      if [ "$ENSAYO" -eq 1 ]; then
+        log "guest $id: ensayo terminado, vuelto al snapshot y sano; no se pone en cuarentena"
+        registrar "$id" ensayo-revertido "$motivos"
+        return 0
+      fi
+      poner_cuarentena "$id" "$motivos"
+      registrar "$id" revertido "$motivos"
+      avisar "homelab-actualizar: guest $id revertido al snapshot tras fallar la verificación ($motivos). En cuarentena."
+      return 1
+    fi
+  fi
+  poner_cuarentena "$id" "la vuelta al snapshot no dejó el guest sano: $motivos"
+  registrar "$id" ROTO "no vuelve sano tras el rollback; snapshot $snap conservado"
+  avisar "homelab-actualizar: guest $id ROTO, la vuelta al snapshot $snap no lo dejó sano. Intervención manual."
+  return 1
+}
+
+sondeo_sano() { # id antes
+  local despues
+  despues=$(sonda "$1")
+  case "$despues" in *FIN*) ;; *) return 1 ;; esac
+  comparar "$1" "$2" "$despues" >/dev/null
+}
+
+# --------------------------------------------------------------------- ronda
+cmd_ronda() {
+  local id estado nombre ok=0 mal=0 saltados=0
+  while read -r id estado nombre; do
+    [ -n "$id" ] || continue
+    seleccionado "$id" || continue
+    if excluido "$id" || en_cuarentena "$id" || [ "$estado" != "running" ]; then
+      saltados=$((saltados + 1)); continue
+    fi
+    if cmd_guest "$id"; then ok=$((ok + 1)); else mal=$((mal + 1)); fi
+  done < <(lista_ct)
+  log "ronda terminada: $ok bien, $mal con problemas, $saltados saltados"
+  [ "$mal" -eq 0 ]
+}
+
+# -------------------------------------------------------------------- estado
+cmd_estado() {
+  local n=0 f
+  echo "Configuración: $CONF"
+  echo "Excluidos: ${EXCLUIR:-ninguno}"
+  if [ -d "$DIR_ESTADO/cuarentena" ]; then
+    for f in "$DIR_ESTADO/cuarentena"/*; do [ -e "$f" ] && n=$((n + 1)); done
+  fi
+  echo "En cuarentena: $n"
+  if [ -s "$DIR_ESTADO/informe.jsonl" ]; then
+    echo "Últimos resultados:"
+    tail -n 10 "$DIR_ESTADO/informe.jsonl"
+  else
+    echo "Sin informes todavía."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------- bloqueo y entrada
+LOCKDIR=""
+adquirir_lock() {
+  [ "$SIMULAR" -eq 1 ] && return 0
+  mkdir -p "$DIR_ESTADO" 2>/dev/null || { echo "No puedo crear $DIR_ESTADO" >&2; exit 2; }
+  LOCKDIR="$DIR_ESTADO/lock"
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    local viejo
+    viejo=$(cat "$LOCKDIR/pid" 2>/dev/null)
+    if [ -n "$viejo" ] && kill -0 "$viejo" 2>/dev/null; then
+      echo "Ya hay otra ejecución en curso (pid $viejo)." >&2
+      exit 3
+    fi
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR" || exit 3
+  fi
+  echo $$ > "$LOCKDIR/pid"
+  trap 'rm -rf "$LOCKDIR"' EXIT
+}
+
+orden=${1:-ayuda}
+case "$orden" in
+  ayuda) ayuda ;;
+  plan) cmd_plan ;;
+  guest) adquirir_lock; cmd_guest "${2:-}" ;;
+  ronda) adquirir_lock; cmd_ronda ;;
+  estado) cmd_estado ;;
+  cuarentena) cmd_cuarentena "${2:-}" "${3:-}" ;;
+  _sonda) printf '%s\n' "$SONDA_GUEST" ;;   # interno: lo usan los tests
+  *) echo "Orden desconocida: $orden" >&2; ayuda >&2; exit 2 ;;
+esac
