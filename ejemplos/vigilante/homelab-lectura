@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# homelab-lectura: envoltorio para la clave del vigilante.
+#
+# Se usa como command="..." en authorized_keys. sshd ejecuta este script en vez
+# de lo que pida el cliente y deja lo pedido en SSH_ORIGINAL_COMMAND. Aquí solo
+# pasa una lista cerrada, por igualdad exacta de texto. Nada de eval, nada de
+# pasar el comando a una shell: cada orden permitida se lanza con exec y
+# argumentos fijos escritos en este fichero.
+#
+# Instalar en cada nodo: /usr/local/bin/homelab-lectura (root:root, 755).
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export LC_ALL=C
+
+# Almacén de copias fijado aquí, no en lo que mande el cliente.
+ALMACEN="nas"
+
+BIN_ACTUALIZAR=/usr/local/bin/homelab-actualizar
+BIN_PVESM=/usr/sbin/pvesm
+BIN_PVECM=/usr/bin/pvecm
+BIN_LOGGER=/usr/bin/logger
+
+orden="${SSH_ORIGINAL_COMMAND-}"
+
+if [ "$orden" = "homelab-actualizar estado" ]; then
+  exec "$BIN_ACTUALIZAR" estado
+elif [ "$orden" = "homelab-actualizar cuarentena lista" ]; then
+  exec "$BIN_ACTUALIZAR" cuarentena lista
+elif [ "$orden" = "pvesm status" ]; then
+  exec "$BIN_PVESM" status
+elif [ "$orden" = "pvecm status" ]; then
+  exec "$BIN_PVECM" status
+elif [ "$orden" = "pvesm list $ALMACEN --content backup" ]; then
+  exec "$BIN_PVESM" list "$ALMACEN" --content backup
+fi
+
+# Todo lo demás se rechaza y queda en syslog (sin caracteres de control, recortado).
+visto=$(printf '%s' "$orden" | tr -c '[:print:]' '?' | cut -c1-200)
+"$BIN_LOGGER" -t homelab-lectura -p auth.warning -- "orden rechazada: [$visto]" 2>/dev/null
+echo "homelab-lectura: orden no permitida." >&2
+exit 126
